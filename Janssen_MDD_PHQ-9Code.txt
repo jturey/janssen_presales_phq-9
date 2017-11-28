@@ -1,0 +1,220 @@
+-----------------------Code for Pulling counts for Janssen PHQ-9 request-----------------------
+
+------Identify patients with a diagnosis of MDD in Raven------
+
+Create table JT_MDD_Raven_coh as
+select encrypted_key_1, min(coalesce(MIN_SERVICE_FROM,STATEMENT_FROM)) as Diag_date
+from claims_submits_diagnosis
+where DIAGNOSIS like ('296.2%')
+or DIAGNOSIS like ('296.3%')
+or DIAGNOSIS like ('F32.%')
+or DIAGNOSIS like ('F33.%')
+or DIAGNOSIS like ('2962%')
+or DIAGNOSIS like ('2963%')
+or DIAGNOSIS like ('F32%')
+or DIAGNOSIS like ('F33%')
+group by 1
+
+------Identify patients with exposure to Anti-Depressants following diagnosis of MDD from Raven ------
+
+Create table JT_MDD_Raven_meds as
+select a.encrypted_key_1,  count(distinct Drug_names) as meds
+from JT_MDD_Raven_coh as a join claims_submits_procedure as b
+join JT_AntiDep_drugbasket as c 
+on b.NDC = c.ndcnum
+and coalesce(SERVICE_FROM, STATEMENT_FROM) > Diag_date
+group by 1
+
+
+------Identify patients with exposure to Anti-Depressants following diagnosis of MDD from Pharmacy------
+
+Create table JT_MDD_Pharmacy_meds as
+select a.encrypted_key_1, count(distinct Drug_names) as meds
+from JT_MDD_Raven_coh as a join rwd.condor_pharmacy_record as b
+on a.encrypted_key_1 = b.encrypted_key_1 
+join JT_AntiDep_drugbasket as c 
+on b.product_or_service_id = c.ndcnum
+and to_date(date_of_service) > Diag_date
+group by 1
+
+
+------Appending the 2 patient cohorts and checking for atleast 3 treatment exposures------
+
+Create table JT_MDD_Raven_final_coh as
+select encrypted_key_1
+from JT_MDD_Raven_meds
+where meds >= 3
+
+union
+
+select encrypted_key_1
+from JT_MDD_Pharmacy_meds
+where meds >= 3
+
+------Identify patients with a diagnosis of MDD in EHR ------
+
+drop table JT_MDD_EHR_coh;
+Create table JT_MDD_EHR_coh as 
+select genpatientID, min(recordedDTTM) as Diag_date
+from rwd.Problems
+where  ICD9 like ('296.2%')
+or ICD9 like ('296.3%')
+or ICD10 like ('F32.%')
+or ICD10 like ('F33.%')
+or ICD9 like ('2962%')
+or ICD9 like ('2963%')
+or ICD10 like ('F32%')
+or ICD10 like ('F33%')
+group by 1
+
+------Identify patients with exposure to Anti-Depressants following diagnosis of MDD from EHR------
+
+
+drop table JT_MDD_EHR_meds;
+Create table JT_MDD_EHR_meds as 
+select a.genpatientID, count(distinct Drug_names) as meds
+from JT_MDD_EHR_coh as a join rwd.medications as b
+on a.genpatientID = b.genpatientID
+join JT_AntiDep_drugbasket as c 
+on b.ndc = c.ndcnum
+and datediff(day,Diag_date,recordedDTTM) >= 1
+group by 1
+
+------Append the EHR linked Raven based patient cohort with that from EHR------
+
+Create table JT_MDD_EHR_finalcoh as
+select distinct genpatientID
+from JT_MDD_Raven_final_coh as a 
+join rwd.mappingdata  as b
+on a.encrypted_key_1 = b.Patientsuffix
+
+union
+
+select distinct genpatientID
+from JT_MDD_EHR_meds 
+where meds >= 3
+
+------Check for PHQ-9 tests in EHR results for the above cohort------
+
+Drop table JT_MDD_EHR_PHQ;
+Create table JT_MDD_EHR_PHQ as
+select a.genpatientID, Panel, test,recordedDTTM, value_x
+from JT_MDD_EHR_finalcoh as a join rwd.results as b
+on a.genpatientID = b.genpatientID
+where (test like ('PHQ%')
+OR test like ('%PHQ')
+OR test in ('PHQ')
+or panel like ('PHQ%')
+or panel like ('%PHQ')
+or panel in ('PHQ'))
+and 
+(test not like ('PHQ-2%')
+or test not like ('PHQ2%')
+OR panel not like ('PHQ-2%')
+or panel not like ('PHQ2%'))
+and ERRORFLAG != 'Y'
+and Resultstatus not in ('Canceled','Cancelled','Entered in Error',
+                         'Rejected','Unacknowledged')
+and YEAR(to_date(A.RECORDEDDTTM))) IN  ('2008','2009','2010','2011',
+                                        '2012','2013','2014','2014',
+                                        '2015','2016','2017')
+
+------Check for >2 valid PHQ-9 Values------
+
+
+drop table JT_MDD_EHR_PHQ_2;
+Create table JT_MDD_EHR_PHQ_2 as
+select a.genpatientID, Panel, test,value_x
+from JT_MDD_EHR_PHQ as a join
+(select genpatientID, count(distinct recordedDTTM) as test_count
+ from JT_MDD_EHR_PHQ group by 1) as b
+on a.genpatientID = b.genpatientID
+where (value_x like '%1%'
+or value_x like '%2%'
+or value_x like '%3%'
+or value_x like '%4%'
+or value_x like '%5%'
+or value_x like '%6%'
+or value_x like '%7%'
+or value_x like '%8%'
+or value_x like '%9%'
+or value_x like '%0%')
+and test_count >= 2
+
+------Link back to claims------
+
+select count(distinct Patientsuffix)
+from JT_MDD_EHR_PHQ_2 as a join rwd.mappingdata  as b
+on a.genpatientID = b.genpatientID
+join claims_submits_header as c
+on b.patientsuffix = c.encrypted_key_1
+
+
+------Identifying Patients with >2 valid PHQ-9 tests in the EHR results alone(not limited to the MDD and anti-Dep based patient pool)------
+
+Create table  JT_EHR_PHQ_Coh as
+select distinct a.genpatientID
+from rwd.results as a join
+(select genpatientID , count(distinct recordedDTTM) as test_count
+ from rwd.results where (test like ('PHQ%')
+OR test like ('%PHQ')
+OR test in ('PHQ')
+or panel like ('PHQ%')
+or panel like ('%PHQ')
+or panel in ('PHQ'))
+and 
+(test not like ('PHQ-2%')
+or test not like ('PHQ2%')
+OR panel not like ('PHQ-2%')
+or panel not like ('PHQ2%'))
+and 
+(value_x like '%1%'
+or value_x like '%2%'
+or value_x like '%3%'
+or value_x like '%4%'
+or value_x like '%5%'
+or value_x like '%6%'
+or value_x like '%7%'
+or value_x like '%8%'
+or value_x like '%9%'
+or value_x like '%0%')
+ group by 1) as b
+on a.genpatientID = b.genpatientID
+where (test like ('PHQ%')
+OR test like ('%PHQ')
+OR test in ('PHQ')
+or panel like ('PHQ%')
+or panel like ('%PHQ')
+or panel in ('PHQ'))
+and 
+(test not like ('PHQ-2%')
+or test not like ('PHQ2%')
+OR panel not like ('PHQ-2%')
+or panel not like ('PHQ2%'))
+and 
+(value_x like '%1%'
+or value_x like '%2%'
+or value_x like '%3%'
+or value_x like '%4%'
+or value_x like '%5%'
+or value_x like '%6%'
+or value_x like '%7%'
+or value_x like '%8%'
+or value_x like '%9%'
+or value_x like '%0%')
+and test_count >= 2
+and ERRORFLAG != 'Y'
+and Resultstatus not in ('Canceled','Cancelled','Entered in Error',
+                         'Rejected','Unacknowledged')
+and YEAR(to_date(A.RECORDEDDTTM))) IN  ('2008','2009','2010','2011',
+                                        '2012','2013','2014','2014',
+                                        '2015','2016','2017')
+
+
+------Link back to claims------
+
+select count(distinct Patientsuffix)
+from JT_EHR_PHQ_Coh as a join rwd.mappingdata  as b
+on a.genpatientID = b.genpatientID
+join claims_submits_header as c
+on b.patientsuffix = c.encrypted_key_1
